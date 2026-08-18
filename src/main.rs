@@ -1,3 +1,4 @@
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -6,6 +7,9 @@ use winit::{
     event_loop::EventLoop,
     window::WindowBuilder,
 };
+
+mod audio;
+
 
 const VERTEX_SHADER_GLSL: &str = r#"
 #version 450
@@ -37,64 +41,12 @@ void main() {
 }
 "#;
 
-const FRAGMENT_SHADER_GLSL: &str = r#"
-#version 450
-
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 fragColor;
-
-layout(set = 0, binding = 0) uniform Globals {
-    float u_time;
-    float u_padding;
-    vec2 u_resolution;
-};
-
-void main() {
-    vec2 uv = v_uv;
-
-    // Centered aspect-ratio normalized coordinates
-    vec2 st = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
-
-    // Animated UV test pattern base color
-    vec3 col = vec3(uv.x, uv.y, 0.5 + 0.5 * sin(u_time));
-
-    // Dynamic radial ripples
-    float dist = length(st);
-    float ring = sin(dist * 25.0 - u_time * 4.0);
-    col += vec3(0.1, 0.3, 0.5) * ring;
-
-    // Grid lines for UV test pattern
-    vec2 grid = abs(fract(uv * 10.0 - 0.5) - 0.5) / fwidth(uv * 10.0);
-    float grid_line = min(grid.x, grid.y);
-    float grid_val = 1.0 - min(grid_line, 1.0);
-    col = mix(col, vec3(1.0), grid_val * 0.4);
-
-    // Vignette border
-    float vignette = uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);
-    vignette = clamp(pow(16.0 * vignette, 0.25), 0.0, 1.0);
-    col *= vignette;
-
-    fragColor = vec4(col, 1.0);
-}
-"#;
-
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     time: f32,
-    padding: f32,
+    _padding: f32,
     resolution: [f32; 2],
-}
-
-impl Globals {
-    fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self) as *const u8,
-                std::mem::size_of::<Self>(),
-            )
-        }
-    }
 }
 
 fn compile_glsl_to_wgsl(source: &str, stage: naga::ShaderStage) -> Result<String, Box<dyn std::error::Error>> {
@@ -117,13 +69,48 @@ fn compile_glsl_to_wgsl(source: &str, stage: naga::ShaderStage) -> Result<String
     Ok(wgsl)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_naga_glsl_sampler() {
+        let glsl = r#"#version 450
+layout(location = 0) out vec4 fragColor;
+layout(set = 0, binding = 1) uniform texture2D u_audio;
+layout(set = 0, binding = 2) uniform sampler u_audio_sampler;
+void main() {
+    fragColor = texture(sampler2D(u_audio, u_audio_sampler), vec2(0.5, 0.5));
+}
+"#;
+        let res = compile_glsl_to_wgsl(glsl, naga::ShaderStage::Fragment);
+        println!("Result: {:?}", res);
+        assert!(res.is_ok());
+    }
+
+
+}
+
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
+    let audio_system = match audio::init_audio() {
+        Ok(sys) => {
+            println!("[Audio] Successfully initialized audio input and FFT processing.");
+            Some(sys)
+        }
+        Err(err) => {
+            eprintln!("[Audio Warning] Could not start audio capture: {}", err);
+            None
+        }
+    };
+
     let event_loop = EventLoop::new()?;
+
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("Quasar - Naga GLSL Fullscreen Shader")
+            .with_title("Quasar - Naga GLSL Hot-Reloading Shader")
             .with_inner_size(winit::dpi::LogicalSize::new(800, 600))
             .build(&event_loop)?,
     );
@@ -156,12 +143,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|f| f.is_srgb())
         .unwrap_or(surface_caps.formats[0]);
 
+    let present_mode = surface_caps
+        .present_modes
+        .iter()
+        .copied()
+        .find(|&mode| mode == wgpu::PresentMode::Fifo)
+        .unwrap_or(surface_caps.present_modes[0]);
+
     let mut config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: surface_format,
         width: size.width.max(1),
         height: size.height.max(1),
-        present_mode: surface_caps.present_modes[0],
+        present_mode,
         alpha_mode: surface_caps.alpha_modes[0],
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
@@ -171,42 +165,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Uniform buffer for animated shader parameter
     let initial_globals = Globals {
         time: 0.0,
-        padding: 0.0,
+        _padding: 0.0,
         resolution: [size.width as f32, size.height as f32],
     };
 
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Globals Uniform Buffer"),
-        contents: initial_globals.as_bytes(),
+        contents: bytemuck::bytes_of(&initial_globals),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Globals Bind Group Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
+    // 2D texture (512x1) for 512 FFT frequency floats
+    let audio_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Audio FFT Texture"),
+        size: wgpu::Extent3d {
+            width: 512,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
     });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Globals Bind Group"),
-        layout: &bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buffer.as_entire_binding(),
-        }],
+    let audio_texture_view = audio_texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
     });
+
+    let audio_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Audio FFT Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Globals and Audio Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                count: None,
+            },
+        ],
+    });
+
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Globals and Audio Bind Group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&audio_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&audio_sampler),
+            },
+        ],
+    });
+
+    // Load initial GLSL fragment shader from shaders/test.glsl
+    let shader_path = "shaders/test.glsl";
+    println!("Loading fragment shader from {}", shader_path);
+    let fs_glsl = std::fs::read_to_string(shader_path)?;
 
     // Compile GLSL to WGSL using Naga
     let vs_wgsl = compile_glsl_to_wgsl(VERTEX_SHADER_GLSL, naga::ShaderStage::Vertex)?;
-    let fs_wgsl = compile_glsl_to_wgsl(FRAGMENT_SHADER_GLSL, naga::ShaderStage::Fragment)?;
+    let fs_wgsl = compile_glsl_to_wgsl(&fs_glsl, naga::ShaderStage::Fragment)?;
 
     let vs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Vertex Shader Module"),
@@ -224,7 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         push_constant_ranges: &[],
     });
 
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let mut render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Render Pipeline"),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
@@ -255,79 +316,185 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         multiview: None,
     });
 
+    // Setup notify file watcher to watch the shaders directory
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(event) = res {
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                let _ = tx.send(());
+            }
+        }
+    })?;
+    watcher.watch(std::path::Path::new("shaders"), RecursiveMode::Recursive)?;
+
     let start_time = Instant::now();
 
-    event_loop.run(move |event, elwt| match event {
-        Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
-            WindowEvent::CloseRequested => elwt.exit(),
-            WindowEvent::Resized(new_size) => {
-                if new_size.width > 0 && new_size.height > 0 {
-                    config.width = new_size.width;
-                    config.height = new_size.height;
-                    surface.configure(&device, &config);
-                    window.request_redraw();
+    event_loop.run(move |event, elwt| {
+        let _watcher_ref = &watcher;
+        match event {
+            Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
+                WindowEvent::CloseRequested => elwt.exit(),
+                WindowEvent::Resized(new_size) => {
+                    if new_size.width > 0 && new_size.height > 0 {
+                        config.width = new_size.width;
+                        config.height = new_size.height;
+                        surface.configure(&device, &config);
+                        window.request_redraw();
+                    }
                 }
-            }
-            WindowEvent::RedrawRequested => {
-                let elapsed = start_time.elapsed().as_secs_f32();
-                let globals = Globals {
-                    time: elapsed,
-                    padding: 0.0,
-                    resolution: [config.width as f32, config.height as f32],
-                };
-                queue.write_buffer(&uniform_buffer, 0, globals.as_bytes());
+                WindowEvent::RedrawRequested => {
+                    let elapsed = start_time.elapsed().as_secs_f32();
+                    let globals = Globals {
+                        time: elapsed,
+                        _padding: 0.0,
+                        resolution: [config.width as f32, config.height as f32],
+                    };
+                    queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&globals));
 
-                match surface.get_current_texture() {
-                    Ok(output) => {
-                        let view = output
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("Render Encoder"),
-                            });
+                    // Lock and read 512 frequency floats from AudioSystem
+                    let audio_data = if let Some(ref sys) = audio_system {
+                        if let Ok(lock) = sys.fft_spectrum.lock() {
+                            *lock
+                        } else {
+                            [0.0f32; 512]
+                        }
+                    } else {
+                        [0.0f32; 512]
+                    };
 
-                        {
-                            let mut render_pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("Render Pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
+                    // Upload FFT spectrum to 1D texture
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture {
+                            texture: &audio_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        bytemuck::cast_slice(&audio_data),
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(512 * 4),
+                            rows_per_image: Some(1),
+                        },
+                        wgpu::Extent3d {
+                            width: 512,
+                            height: 1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+
+
+                    match surface.get_current_texture() {
+                        Ok(output) => {
+                            let view = output
+                                .texture
+                                .create_view(&wgpu::TextureViewDescriptor::default());
+                            let mut encoder =
+                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("Render Encoder"),
                                 });
 
-                            render_pass.set_pipeline(&render_pipeline);
-                            render_pass.set_bind_group(0, &bind_group, &[]);
-                            render_pass.draw(0..6, 0..1);
-                        }
+                            {
+                                let mut render_pass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("Render Pass"),
+                                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                            view: &view,
+                                            resolve_target: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        })],
+                                        depth_stencil_attachment: None,
+                                        timestamp_writes: None,
+                                        occlusion_query_set: None,
+                                    });
 
-                        queue.submit(std::iter::once(encoder.finish()));
-                        output.present();
+                                render_pass.set_pipeline(&render_pipeline);
+                                render_pass.set_bind_group(0, &bind_group, &[]);
+                                render_pass.draw(0..6, 0..1);
+                            }
+
+                            queue.submit(std::iter::once(encoder.finish()));
+                            output.present();
+                        }
+                        Err(wgpu::SurfaceError::Outdated) => {
+                            surface.configure(&device, &config);
+                        }
+                        Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                        Err(e) => eprintln!("Surface error: {:?}", e),
                     }
-                    Err(wgpu::SurfaceError::Outdated) => {
-                        surface.configure(&device, &config);
+                }
+                _ => {}
+            },
+            Event::AboutToWait => {
+                // Check if any shader modification events were triggered
+                if rx.try_recv().is_ok() {
+                    // Drain remaining events in channel (debounce)
+                    while rx.try_recv().is_ok() {}
+
+                    println!("[Hot-Reload] Change detected in shaders/, recompiling test.glsl...");
+                    match std::fs::read_to_string("shaders/test.glsl") {
+                        Ok(new_fs_glsl) => {
+                            match compile_glsl_to_wgsl(&new_fs_glsl, naga::ShaderStage::Fragment) {
+                                Ok(new_fs_wgsl) => {
+                                    let new_fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                        label: Some("Fragment Shader Module (Hot-reloaded)"),
+                                        source: wgpu::ShaderSource::Wgsl(new_fs_wgsl.into()),
+                                    });
+
+                                    let new_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                                        label: Some("Render Pipeline (Hot-reloaded)"),
+                                        layout: Some(&pipeline_layout),
+                                        vertex: wgpu::VertexState {
+                                            module: &vs_module,
+                                            entry_point: "main",
+                                            buffers: &[],
+                                        },
+                                        fragment: Some(wgpu::FragmentState {
+                                            module: &new_fs_module,
+                                            entry_point: "main",
+                                            targets: &[Some(wgpu::ColorTargetState {
+                                                format: config.format,
+                                                blend: Some(wgpu::BlendState::REPLACE),
+                                                write_mask: wgpu::ColorWrites::ALL,
+                                            })],
+                                        }),
+                                        primitive: wgpu::PrimitiveState {
+                                            topology: wgpu::PrimitiveTopology::TriangleList,
+                                            strip_index_format: None,
+                                            front_face: wgpu::FrontFace::Ccw,
+                                            cull_mode: None,
+                                            polygon_mode: wgpu::PolygonMode::Fill,
+                                            unclipped_depth: false,
+                                            conservative: false,
+                                        },
+                                        depth_stencil: None,
+                                        multisample: wgpu::MultisampleState::default(),
+                                        multiview: None,
+                                    });
+
+                                    render_pipeline = new_pipeline;
+                                    println!("[Hot-Reload] Successfully recompiled and reloaded shaders/test.glsl!");
+                                }
+                                Err(err) => {
+                                    eprintln!("[Hot-Reload Error] Failed to compile shaders/test.glsl:\n{}", err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[Hot-Reload Error] Failed to read shaders/test.glsl: {}", err);
+                        }
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                    Err(e) => eprintln!("Surface error: {:?}", e),
                 }
 
                 window.request_redraw();
             }
             _ => {}
-        },
-        Event::AboutToWait => {
-            window.request_redraw();
         }
-        _ => {}
     })?;
 
     Ok(())
 }
+

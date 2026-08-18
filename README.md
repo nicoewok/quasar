@@ -41,7 +41,7 @@ cargo run --release
 Before running:
 ```bash
 # Enter the isolated environment
-nix-shell
+nix-shell --run "cargo run"
 ```
 
 ## Customization

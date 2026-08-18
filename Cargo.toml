@@ -9,3 +9,11 @@ wgpu = "0.19"
 naga = { version = "0.19", features = ["glsl-in", "wgsl-out"] }
 pollster = "0.3"
 env_logger = "0.11"
+bytemuck = { version = "1.14", features = ["derive"] }
+notify = "6.1"
+cpal = "0.15"
+ringbuf = "0.3"
+realfft = "3.3"
+rustfft = "6.1"
+
+
